@@ -14,16 +14,21 @@
       this.idle = 0; this.level = 0; this.spot = null; this.path = [];
       this.flash = 0; this.cd = 0; this.t = 0; this.stuck = 0;
       this.seen = new Set(); this.onReact = null;
+      this.pointT = 0; this.story = false;     // сюжетное указание: дрон показывает спящий знак
     }
     // Игрок продвинул игру (посадил): подсказки сбрасываются
     notifyAction() { this.idle = 0; this.level = 0; this.spot = null; this.path = []; this.state = 'follow'; }
     // Реакция светом на событие: каждое событие один раз, между реакциями пауза P_COMMENT_CD
-    react(name) {
+    react(name, force) {
       if (this.seen.has(name)) return false;
-      if (this.cd > 0 && name !== 'first_plant') return false;
+      if (this.cd > 0 && name !== 'first_plant' && !force) return false;   // сюжетные события не глушатся паузой
       this.seen.add(name); this.cd = DRONE.COMMENT_CD; this.flash = 1;
       if (this.onReact) this.onReact(name);
       return true;
+    }
+    // Сюжет: дрон на несколько секунд летит к знаку и светит над ним (без слов)
+    pointAt(spot, seconds) {
+      this.spot = spot; this.state = 'point'; this.story = true; this.pointT = seconds; this.level = 0; this.path = [];
     }
     findSpot(pl) {
       const w = this.world; let best = null, bd = Infinity;
@@ -59,7 +64,10 @@
       this.t += dt;
       this.cd = Math.max(0, this.cd - dt);
       this.flash = Math.max(0, this.flash - dt * 1.5);
-      if (this.enabled) {
+      if (this.story) {
+        this.pointT -= dt;
+        if (this.pointT <= 0) { this.story = false; this.spot = null; this.path = []; this.state = 'follow'; this.level = 0; this.idle = 0; }
+      } else if (this.enabled) {
         this.idle += dt;
         if (this.level === 0 && this.idle >= DRONE.HINT_IDLE) this._hint(pl, 1);
         else if (this.level === 1 && this.idle >= 2 * DRONE.HINT_IDLE) this._hint(pl, 2);

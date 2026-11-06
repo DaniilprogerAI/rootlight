@@ -3,14 +3,17 @@
 // Dormant, озеленение почвы, вершинный AO. Все числа — параметры P (как P_... в GDD).
 (function (root) {
   'use strict';
-  const CHUNK = 16, CX = 5, CZ = 5, HEIGHT = 16;
+  const CHUNK = 16, CX = 7, CZ = 7, HEIGHT = 16;
   const SIZE_X = CHUNK * CX, SIZE_Z = CHUNK * CZ;
-  const SOIL = 1, WOOD = 2, LEAF = 3, WATER = 4, MOSS = 5, SPROUT = 6;
+  const SOIL = 1, WOOD = 2, LEAF = 3, WATER = 4, MOSS = 5, SPROUT = 6, SAND = 7, MUD = 8, ROCK = 9, CRYSTAL = 10,
+    GLYPH = 11, LEAF_B = 12, LEAF_C = 13, GLYPH_ON = 14;
   const COLORS = {
     1: [0.42, 0.42, 0.40], 2: [0.45, 0.30, 0.18], 3: [0.25, 0.85, 0.45],
     4: [0.22, 0.50, 0.85], 5: [0.28, 0.50, 0.26], 6: [0.45, 0.55, 0.35],
+    7: [0.62, 0.40, 0.26], 8: [0.20, 0.34, 0.36], 9: [0.30, 0.30, 0.33], 10: [0.45, 0.90, 0.95],
+    11: [0.55, 0.45, 0.25], 12: [0.95, 0.65, 0.20], 13: [0.40, 0.85, 0.95], 14: [0.50, 1.00, 0.80],
   };
-  const GLOW = { 3: 1.0, 4: 0.35, 5: 0.25, 6: 0.5 };   // доля свечения на вершину
+  const GLOW = { 3: 1.0, 4: 0.35, 5: 0.25, 6: 0.5, 10: 1.0, 11: 0.45, 12: 0.9, 13: 1.0, 14: 1.0 };   // доля свечения на вершину
   const P = {
     W_MIN: 0.2, L_MIN: 0.3,              // P_W_MIN, P_L_MIN
     WATER_R: 22,                         // дальность влажности от родника, блоки
@@ -20,7 +23,25 @@
     PURGE_R: 6, WAVE_TIME: 2.5,          // озеленение вокруг Mature
     MAX_VOX: 40, STAGE_TIME: 1.5, STAGES: 5,
     DAY_LEN: 720,                        // P_DAY_LEN = 12 мин
+    // погода (MECH-08, поднята с этапа 3; интервал между штормами в прототипе короче GDD: 900 с)
+    STORM_FIRST: 100, STORM_WARN: 20, STORM_DUR: 60, STORM_GAP: 170,
+    STORM_W: 0.3, STORM_L: 0.2, CLOUD_SUN: 0.35,
+    // инструменты ухода (лейка)
+    POUR_R: 3, POUR_BOOST: 0.35, POUR_TIME: 90, POUR_CAP: 0.4, CAN_MAX: 4,
+    GLYPH_R: 9,                          // радиус «посева» вокруг знака сюжета
   };
+  const BIOMES = [
+    { name: 'Серая пустошь',   hum: 0,     soil: 1, leaf: 3 },
+    { name: 'Медные дюны',     hum: -0.10, soil: 7, leaf: 12 },
+    { name: 'Туманная низина', hum: 0.25,  soil: 8, leaf: 13 },
+  ];
+  const ANCHORS = [[56, 84], [24, 26], [90, 30]];
+  const SPRING_SITES = [[44, 76], [72, 70], [28, 36], [84, 26], [100, 42], [86, 50]];
+  const GLYPH_SITES = [
+    { x: 56, z: 72, need: { count: 3, forms: 1 }, pattern: ['.XXX.', 'X...X', 'X.X.X', 'X...X', '.XXX.'] },   // круг
+    { x: 24, z: 22, need: { count: 3, forms: 2 }, pattern: ['..X..', '.X.X.', 'X.X.X', '.X.X.', '..X..'] },   // ромб
+    { x: 94, z: 22, need: { count: 4, forms: 2 }, pattern: ['..X..', '..X..', 'XXXXX', '..X..', '..X..'] },   // крест
+  ];
   const VARIANTS = {
     sapling:   { th: 4, thv: 2, rx: 2, ry: 2, name: 'саженец' },
     spreading: { th: 5, thv: 2, rx: 3, ry: 2, name: 'раскидистое' },
@@ -39,7 +60,8 @@
   const SHADE = [0.9, 0.9, 1.0, 0.6, 0.85, 0.85];
   const AO_BRIGHT = [0.5, 0.7, 0.85, 1.0];
 
-  const isSoil = (id) => id === SOIL || id === MOSS;
+  const isSoil = (id) => id === SOIL || id === MOSS || id === SAND || id === MUD;
+  const isBaseSoil = (id) => id === SOIL || id === SAND || id === MUD;
   const s2l = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
 
   function hash3(x, y, z, s) {
@@ -50,10 +72,11 @@
   function voxelColor(id, x, y, z) {
     const b = COLORS[id];
     const j = 0.88 + 0.24 * ((hash3(x, y, z, 7) % 1000) / 1000);
-    return [b[0] * j, b[1] * j, b[2] * j];
+    return [Math.min(1, b[0] * j), Math.min(1, b[1] * j), Math.min(1, b[2] * j)];
   }
-  function valueNoise(seed, x, z) {
-    const fx = x * 0.05, fz = z * 0.05;
+  function valueNoise(seed, x, z, freq) {
+    const f = freq || 0.05;
+    const fx = x * f, fz = z * f;
     const ix = Math.floor(fx), iz = Math.floor(fz);
     const tx = fx - ix, tz = fz - iz;
     const sx = tx * tx * (3 - 2 * tx), sz = tz * tz * (3 - 2 * tz);
@@ -73,35 +96,107 @@
       this.plants = [];          // все растения (любое состояние)
       this.waves = [];           // активные волны озеленения
       this.timeOfDay = 0.12;     // 0 рассвет · 0.25 день · 0.5 закат · 0.75 ночь (старт: раннее утро, ~3.5 мин хорошего света)
+      this.clock = 0;            // секунды игры (для погоды и полива)
+      this.weather = { state: 'clear', cloud: 0, rain: 0, t: 0, next: P.STORM_FIRST, dur: 0, n: 0 };
+      this.irrigation = [];      // зоны полива лейкой
+      this.glyphs = [];          // знаки сюжета
+      this.chapter = 0;          // сколько знаков пробуждено
+      this.answered = false;     // мир ответил (все знаки)
+      this.spawn = { x: 56, y: 3, z: 84 };
+      this.biomeMap = null;
     }
 
     rawSet(x, y, z, id) {
       this.chunks[(x >> 4) + CX * (z >> 4)][(x & 15) + CHUNK * (y + CHUNK * (z & 15))] = id;
     }
 
+    biomeAt(x, z) {
+      if (!this.biomeMap) return 0;
+      x = Math.max(0, Math.min(SIZE_X - 1, Math.floor(x))); z = Math.max(0, Math.min(SIZE_Z - 1, Math.floor(z)));
+      return this.biomeMap[x + SIZE_X * z];
+    }
+
     generate() {
-      const H = new Uint8Array(SIZE_X * SIZE_Z);
+      const N = SIZE_X * SIZE_Z, seed = this.seed;
+      this.biomeMap = new Uint8Array(N);
       for (let x = 0; x < SIZE_X; x++) for (let z = 0; z < SIZE_Z; z++) {
-        const n = valueNoise(this.seed, x, z);
-        H[x + SIZE_X * z] = 2 + Math.min(2, Math.max(0, Math.floor(n * 3)));
+        const wx = x + (valueNoise(seed + 11, x, z, 0.04) - 0.5) * 20, wz = z + (valueNoise(seed + 12, x, z, 0.04) - 0.5) * 20;
+        let best = 0, bd = Infinity;
+        ANCHORS.forEach((a, i) => { const d = Math.hypot(wx - a[0], wz - a[1]); if (d < bd) { bd = d; best = i; } });
+        this.biomeMap[x + SIZE_X * z] = best;
       }
-      const anchors = [[20, 20], [58, 24], [24, 58], [56, 56]];
-      const pool = new Set();
-      this.springs = anchors.map((a, i) => {
-        const sx = a[0] + (hash3(i, 1, 0, this.seed) % 11) - 5;
-        const sz = a[1] + (hash3(i, 2, 0, this.seed) % 11) - 5;
-        const hc = H[sx + SIZE_X * sz];
-        for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
-          if (dx * dx + dz * dz > 2) continue;
-          H[(sx + dx) + SIZE_X * (sz + dz)] = hc;
-          pool.add((sx + dx) + SIZE_X * (sz + dz));
+      // высоты: свой рельеф у каждого биома, затем сглаживание (границы становятся пологими)
+      let raw = new Float32Array(N);
+      for (let x = 0; x < SIZE_X; x++) for (let z = 0; z < SIZE_Z; z++) {
+        const i = x + SIZE_X * z, b = this.biomeMap[i];
+        raw[i] = b === 0 ? 2 + valueNoise(seed, x, z, 0.05) * 3
+               : b === 1 ? 3 + valueNoise(seed + 5, x, z, 0.09) * 5
+               : 1 + valueNoise(seed + 7, x, z, 0.06) * 2;
+      }
+      for (let pass = 0; pass < 2; pass++) {
+        const r2 = new Float32Array(N);
+        for (let x = 0; x < SIZE_X; x++) for (let z = 0; z < SIZE_Z; z++) {
+          let s = 0, c = 0;
+          for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx, zz = z + dz;
+            if (xx < 0 || zz < 0 || xx >= SIZE_X || zz >= SIZE_Z) continue;
+            s += raw[xx + SIZE_X * zz]; c++;
+          }
+          r2[x + SIZE_X * z] = s / c;
         }
-        return { x: sx, z: sz, y: hc - 1 };
-      });
-      for (let x = 0; x < SIZE_X; x++) for (let z = 0; z < SIZE_Z; z++) {
-        const h = H[x + SIZE_X * z];
-        for (let y = 0; y < h; y++) this.rawSet(x, y, z, (y === h - 1 && pool.has(x + SIZE_X * z)) ? WATER : SOIL);
+        raw = r2;
       }
+      const H = new Uint8Array(N);
+      for (let i = 0; i < N; i++) H[i] = Math.max(1, Math.min(7, Math.round(raw[i])));
+      const reserved = new Set();
+      const flatten = (cx, cz, r, rid) => {
+        const h = H[cx + SIZE_X * cz];
+        for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+          const x = cx + dx, z = cz + dz;
+          if (x < 0 || z < 0 || x >= SIZE_X || z >= SIZE_Z) continue;
+          H[x + SIZE_X * z] = h; if (rid) reserved.add(x + SIZE_X * z);
+        }
+        return h;
+      };
+      // старт и знаки сюжета: ровные площадки
+      const sp = this.spawn; flatten(sp.x, sp.z, 3, true);
+      this.glyphs = GLYPH_SITES.map((g, k) => {
+        const h = flatten(g.x, g.z, 3, true);
+        const cells = [];
+        g.pattern.forEach((row, rz) => { for (let rx = 0; rx < 5; rx++) if (row[rx] === 'X') cells.push([g.x - 2 + rx, g.z - 2 + rz]); });
+        return { id: k, x: g.x, z: g.z, y: h - 1, need: g.need, cells, active: false, order: 0, biome: this.biomeMap[g.x + SIZE_X * g.z] };
+      });
+      // родники: бассейн ровной воды (в низине побольше)
+      const pool = new Set();
+      this.springs = SPRING_SITES.map((s, i) => {
+        const sx = s[0] + (hash3(i, 1, 0, seed) % 7) - 3, sz = s[1] + (hash3(i, 2, 0, seed) % 7) - 3;
+        const b = this.biomeMap[sx + SIZE_X * sz], rr = b === 2 ? 5 : 2;
+        const hc = H[sx + SIZE_X * sz];
+        for (let dz = -2; dz <= 2; dz++) for (let dx = -2; dx <= 2; dx++) {
+          if (dx * dx + dz * dz > rr) continue;
+          const k = (sx + dx) + SIZE_X * (sz + dz);
+          H[k] = hc; pool.add(k); reserved.add(k);
+        }
+        return { x: sx, z: sz, y: hc - 1, biome: b };
+      });
+      // заливка: верхний слой — почва биома
+      for (let x = 0; x < SIZE_X; x++) for (let z = 0; z < SIZE_Z; z++) {
+        const i = x + SIZE_X * z, h = H[i], soil = BIOMES[this.biomeMap[i]].soil;
+        for (let y = 0; y < h; y++) this.rawSet(x, y, z, (y === h - 1 && pool.has(i)) ? WATER : soil);
+      }
+      // камни (дюны, пустошь) и кристаллы (низина): декор, не растительность
+      for (let x = 0; x < SIZE_X; x++) for (let z = 0; z < SIZE_Z; z++) {
+        const i = x + SIZE_X * z;
+        if (reserved.has(i)) continue;
+        const b = this.biomeMap[i], h = H[i], r = hash3(x, 0, z, seed + 31);
+        let id = 0, k = 0;
+        if (b === 1 && r % 100 < 3) { id = ROCK; k = 1 + (r >> 8) % 3; }
+        else if (b === 0 && r % 1000 < 8) { id = ROCK; k = 1; }
+        else if (b === 2 && r % 100 < 2) { id = CRYSTAL; k = 2 + (r >> 8) % 2; }
+        for (let y = h; y < h + k && y < HEIGHT; y++) this.rawSet(x, y, z, id);
+      }
+      for (const g of this.glyphs) for (const c of g.cells) this.rawSet(c[0], g.y, c[1], GLYPH);
+      sp.y = H[sp.x + SIZE_X * sp.z];       // высота ног на старте
     }
 
     getVoxel(x, y, z) {
@@ -135,13 +230,20 @@
     }
 
     // ---- MECH-04: вода и свет ----
-    waterAt(x, z) {
-      let w = 0;
-      for (const s of this.springs) {
-        const d = Math.hypot(x - s.x, z - s.z);
-        w = Math.max(w, 1 - d / P.WATER_R);
-      }
-      return Math.max(0, Math.min(1, w));
+    waterAt(x, z) {                 // постоянная влажность: родники + климат биома
+      let s = 0;
+      for (const sp of this.springs) s = Math.max(s, 1 - Math.hypot(x - sp.x, z - sp.z) / P.WATER_R);
+      return Math.max(0, Math.min(1, s + BIOMES[this.biomeAt(x, z)].hum));
+    }
+    irrigationAt(x, z) {            // полив лейкой: временная добавка к W
+      let b = 0;
+      for (const zn of this.irrigation) if (this.clock < zn.until && Math.hypot(x - zn.x, z - zn.z) <= zn.r) b += zn.boost;
+      return Math.min(P.POUR_CAP, b);
+    }
+    pour(x, z) {
+      const zn = { x, z, r: P.POUR_R, boost: P.POUR_BOOST, until: this.clock + P.POUR_TIME };
+      this.irrigation.push(zn);
+      return zn;
     }
     sunVector(t) {
       const a = 2 * Math.PI * t;
@@ -151,7 +253,7 @@
     }
     lightAt(x, y, z) {
       const sv = this.sunVector(this.timeOfDay);
-      let sun = Math.max(0, Math.min(1, sv.y * 1.2));
+      let sun = Math.max(0, Math.min(1, sv.y * 1.2)) * (1 - P.CLOUD_SUN * this.weather.cloud);
       if (sun > 0) {
         for (let s = 1; s <= 12; s++) {
           const px = Math.floor(x + 0.5 + sv.x * s), py = Math.floor(y + 0.5 + sv.y * s), pz = Math.floor(z + 0.5 + sv.z * s);
@@ -167,7 +269,7 @@
     }
     // Соседство и итоговая оценка условий (MECH-01 п.1, MECH-03)
     evaluate(x, y, z, self) {
-      const W = this.waterAt(x, z);
+      const W = Math.min(1, this.waterAt(x, z) + this.irrigationAt(x, z) + P.STORM_W * this.weather.rain);
       let N = 0, tallN = 0;
       for (const p of this.plants) {
         if (p === self || (p.state !== 'mature' && p.state !== 'growing')) continue;
@@ -177,10 +279,69 @@
       }
       const L = this.lightAt(x, y, z);
       const Weff = Math.min(1, W + Math.min(P.SYM_CAP, P.SYM * N));
-      const Leff = Math.max(0, L - Math.min(P.COMP_CAP, P.COMP * tallN));
+      const Leff = Math.max(0, L - Math.min(P.COMP_CAP, P.COMP * tallN) - P.STORM_L * this.weather.rain);
       const ok = Weff >= P.W_MIN && Leff >= P.L_MIN;
       const variant = !ok ? null : (Weff < 0.5 ? 'sapling' : (Leff < 0.6 ? 'spreading' : 'tall'));
       return { W, L, N, tallN, Weff, Leff, ok, variant };
+    }
+
+    // Погода (MECH-08): ясно → тучи (предупреждение) → дождь → прояснение. Детерминирована от seed.
+    updateWeather(dt) {
+      this.clock += dt;
+      const wt = this.weather; wt.t += dt;
+      if (wt.state === 'clear') {
+        if (this.clock >= wt.next) { wt.state = 'warn'; wt.t = 0; }
+      } else if (wt.state === 'warn') {
+        wt.cloud = Math.min(1, wt.t / P.STORM_WARN);
+        if (wt.t >= P.STORM_WARN) { wt.state = 'rain'; wt.t = 0; wt.dur = P.STORM_DUR + (hash3(wt.n, 1, 0, this.seed) % 30); }
+      } else if (wt.state === 'rain') {
+        wt.cloud = 1; wt.rain = Math.min(1, wt.t / 8);
+        if (wt.t >= wt.dur) { wt.state = 'clearing'; wt.t = 0; }
+      } else {
+        wt.rain = Math.max(0, 1 - wt.t / 15); wt.cloud = Math.max(0, 1 - wt.t / 25);
+        if (wt.t >= 25) { wt.state = 'clear'; wt.rain = 0; wt.cloud = 0; wt.n++; wt.next = this.clock + P.STORM_GAP + (hash3(wt.n, 2, 0, this.seed) % 60); }
+      }
+      if (this.irrigation.length) this.irrigation = this.irrigation.filter((z) => this.clock < z.until);
+    }
+    forceStorm() { if (this.weather.state === 'clear') this.weather.next = this.clock; }
+    weatherName() {
+      const s = this.weather.state;
+      return s === 'clear' ? 'ясно' : (s === 'warn' ? 'собираются тучи' : (s === 'rain' ? 'дождь' : 'прояснение'));
+    }
+
+    // Знаки сюжета: пробуждаются по порядку (один замок за раз), когда рядом выросло достаточно деревьев
+    updateGlyphs() {
+      const woke = [];
+      for (const g of this.glyphs) {
+        if (g.active || g.id !== this.chapter) continue;
+        const near = this.plants.filter((p) => p.state === 'mature' && !p.bench && Math.hypot(p.o.x - g.x, p.o.z - g.z) <= P.GLYPH_R);
+        const forms = new Set(near.map((p) => p.variant));
+        if (near.length >= g.need.count && forms.size >= g.need.forms) {
+          g.active = true; this.chapter++; g.order = this.chapter;
+          for (const c of g.cells) this.setVoxel(c[0], g.y, c[1], GLYPH_ON);
+          woke.push(g);
+        }
+      }
+      if (woke.length && this.chapter >= this.glyphs.length) this.answered = true;
+      return woke;
+    }
+    nextGlyph() {                    // следующий по порядку спящий знак (или null, если мир уже ответил)
+      return this.glyphs.find((g) => !g.active && g.id === this.chapter) || null;
+    }
+
+    // Сканер дрона: оценка клеток вокруг (хорошо / на грани / не вырастет)
+    scanGrid(cx, cz, r, step) {
+      const out = [];
+      for (let x = Math.round(cx - r); x <= cx + r; x += step) for (let z = Math.round(cz - r); z <= cz + r; z += step) {
+        if (Math.hypot(x - cx, z - cz) > r || x < 0 || z < 0 || x >= SIZE_X || z >= SIZE_Z) continue;
+        const gy = this.groundY(x, z);
+        if (gy < 0 || !isSoil(this.getVoxel(x, gy, z))) continue;
+        const o = { x, y: gy + 1, z };
+        if (!Plant.canPlant(this, o)) continue;
+        const e = this.evaluate(x, o.y, z, null);
+        out.push({ x, y: o.y, z, rate: !e.ok ? 'bad' : ((e.Weff < 0.35 || e.Leff < 0.45) ? 'marginal' : 'good') });
+      }
+      return out;
     }
 
     startWave(x, z) { this.waves.push(new Wave(this, x, z, P.PURGE_R)); }
@@ -288,7 +449,7 @@
       while (this.idx < target && n < P.MAX_VOX) {
         const c = this.cells[this.idx++];
         const y = this.world.groundY(c.x, c.z);
-        if (y >= 0 && this.world.getVoxel(c.x, y, c.z) === SOIL) { this.world.setVoxel(c.x, y, c.z, MOSS); n++; }
+        if (y >= 0 && isBaseSoil(this.world.getVoxel(c.x, y, c.z))) { this.world.setVoxel(c.x, y, c.z, MOSS); n++; }
       }
       return this.idx >= this.cells.length;
     }
@@ -299,6 +460,7 @@
     constructor(world, o, opts) {
       this.world = world; this.o = o;
       this.force = !!(opts && opts.force);      // для бенчмарка: игнорировать условия
+      this.bench = !!(opts && opts.bench);      // деревья бенчмарка не будят знаки сюжета
       this.state = 'eval'; this.variant = null; this.blueprint = null;
       this.placed = 0; this.budget = 0; this.rate = 0; this.reeval = 0;
       this.top = o.y; this.sprout = false; this.done = false;
@@ -312,7 +474,7 @@
     }
     get title() { return this.variant ? VARIANTS[this.variant].name : null; }
 
-    static makeBlueprint(seed, o, variant) {
+    static makeBlueprint(seed, o, variant, leaf) {
       const V = VARIANTS[variant];
       const h = hash3(o.x, o.y, o.z, seed);
       const th = V.th + (h % V.thv);
@@ -321,13 +483,13 @@
       for (let dy = -V.ry; dy <= V.ry; dy++) for (let dx = -V.rx; dx <= V.rx; dx++) for (let dz = -V.rx; dz <= V.rx; dz++) {
         if ((dx * dx + dz * dz) / (V.rx * V.rx) + (dy * dy) / (V.ry * V.ry) > 1.25) continue;
         if (dx === 0 && dz === 0 && dy < 0) continue;
-        bp.push([dx, th + dy, dz, LEAF]);
+        bp.push([dx, th + dy, dz, leaf || LEAF]);
       }
       return { voxels: bp, th, top: o.y + th + V.ry, variant };
     }
     static canPlant(w, o) {
       if (o.x < 4 || o.z < 4 || o.x > SIZE_X - 5 || o.z > SIZE_Z - 5) return false;
-      if (!isSoil(w.getVoxel(o.x, o.y - 1, o.z))) return false;
+      if (o.y > 5 || !isSoil(w.getVoxel(o.x, o.y - 1, o.z))) return false;     // на высоких гребнях не растёт: крона упёрлась бы в потолок мира
       for (let i = 0; i < 10; i++) if (w.getVoxel(o.x, o.y + i, o.z) !== 0) return false;
       return true;
     }
@@ -351,7 +513,7 @@
       }
     }
     _start(variant) {
-      const bp = Plant.makeBlueprint(this.world.seed, this.o, variant);
+      const bp = Plant.makeBlueprint(this.world.seed, this.o, variant, BIOMES[this.world.biomeAt(this.o.x, this.o.z)].leaf);
       this.variant = variant; this.blueprint = bp.voxels; this.top = bp.top;
       this.rate = bp.voxels.length / (P.STAGES * P.STAGE_TIME);
       this.state = 'growing';
@@ -385,8 +547,8 @@
   }
 
   const api = {
-    VoxelWorld, Plant, Wave, P, VARIANTS, CHUNK, CX, CZ, HEIGHT, SIZE_X, SIZE_Z,
-    SOIL, WOOD, LEAF, WATER, MOSS, SPROUT, hash3, voxelColor, isSoil,
+    VoxelWorld, Plant, Wave, P, VARIANTS, BIOMES, CHUNK, CX, CZ, HEIGHT, SIZE_X, SIZE_Z,
+    SOIL, WOOD, LEAF, WATER, MOSS, SPROUT, SAND, MUD, ROCK, CRYSTAL, GLYPH, LEAF_B, LEAF_C, GLYPH_ON, hash3, voxelColor, isSoil, isBaseSoil,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.RL = api;
 })(typeof window !== 'undefined' ? window : globalThis);
